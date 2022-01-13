@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
 
+mod vk_format;
+
+pub use vk_format::VkFormat;
+
 fn main() -> anyhow::Result<()> {
     #[rustfmt::skip]
     let file = &[
@@ -130,13 +134,17 @@ fn main() -> anyhow::Result<()> {
 
         let ktx2 = Reader::new(file)?;
 
-        dbg!(&ktx2.header);
-
-        /*for (compressed, decompressed) in ktx2.compressed_images.iter().zip(ktx2.images_decompressed()) {
-            //dbg!((compressed.len(), decompressed.unwrap().len()));
-        }*/
-
-        dbg!(&ktx2.key_values, &ktx2.custom_key_values);
+        if ktx2.header.vk_format == VkFormat::UNDEFINED {
+            if ktx2.vk_format() == VkFormat::UNDEFINED {
+                dbg!(
+                    &ktx2.header.supercompression_scheme,
+                    &ktx2.descriptor_block,
+                    &ktx2.samples,
+                    &ktx2.key_values.swizzle
+                );
+                dbg!(ktx2.vk_format());
+            }
+        }
     }
 
     Ok(())
@@ -233,10 +241,10 @@ impl<T: std::io::Read> Reader<T> {
             descriptor_block_size: this.read_u16()?,
         };
 
-        let block = DescriptorBlock {
+        let descriptor_block = DescriptorBlock {
             color_model: ColorModel(this.read_u8()?),
+            color_primaries: ColorPrimaries::parse(this.read_u8()?).unwrap(),
             transfer_function: TransferFunction::parse(this.read_u8()?).unwrap(),
-            color_primaries: this.read_u8()?,
             flags: DescriptorBlockFlags {
                 bits: this.read_u8()?,
             },
@@ -244,24 +252,51 @@ impl<T: std::io::Read> Reader<T> {
             bytes_plane: this.read_array()?,
         };
 
-        dbg!(descriptor_block_header, block);
+        let num_samples = (dfd_total_size as usize - (this.read_bytes - dfd_start))
+            / std::mem::size_of::<RawSampleInformation>();
 
-        //dbg!(descriptor_block_header, block);
+        let samples = (0..num_samples)
+            .map(|_| {
+                let sample = RawSampleInformation {
+                    bit_offset: this.read_u16()?,
+                    bit_length: this.read_u8()?,
+                    channel_type_and_qualifiers: this.read_u8()?,
+                    sample_position: this.read_array()?,
+                    sample_lower: this.read_u32()?,
+                    sample_upper: this.read_u32()?,
+                };
 
-        while this.read_bytes - dfd_start != dfd_total_size as usize {
-            let sample = SampleInformation {
-                bit_offset: this.read_u16()?,
-                bit_length: this.read_u8()?,
-                channel_type_and_qualifiers: this.read_u8()?,
-                sample_position: this.read_array()?,
-                sample_upper: this.read_u32()?,
-                sample_lower: this.read_u32()?,
-            };
+                let qualifiers = SampleQualifiers {
+                    bits: sample.channel_type_and_qualifiers >> 4,
+                };
 
-            dbg!(ChannelType::parse(sample.channel_type_and_qualifiers));
+                let channel_type_bits = sample.channel_type_and_qualifiers & 0b00001111;
 
-            dbg!(sample);
-        }
+                Ok(SampleInformation {
+                    channel_type: match descriptor_block.color_model {
+                        ColorModel::ETC1S => {
+                            ChannelType::Etc1S(Etc1SChannelType::parse(channel_type_bits).unwrap())
+                        }
+                        ColorModel::UASTC => {
+                            ChannelType::Uastc(UastcChannelType::parse(channel_type_bits).unwrap())
+                        }
+                        _ => ChannelType::Regular(RegularChannelType(channel_type_bits)),
+                    },
+                    sample_position: sample.sample_position,
+                    sample_lower: if qualifiers.contains(SampleQualifiers::FLOAT) {
+                        SamplerBound::Float(f32::from_le_bytes(sample.sample_lower.to_le_bytes()))
+                    } else {
+                        SamplerBound::Uint(sample.sample_lower)
+                    },
+                    sample_upper: if qualifiers.contains(SampleQualifiers::FLOAT) {
+                        SamplerBound::Float(f32::from_le_bytes(sample.sample_upper.to_le_bytes()))
+                    } else {
+                        SamplerBound::Uint(sample.sample_upper)
+                    },
+                    qualifiers,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let kv_start_bytes = this.read_bytes;
 
@@ -287,7 +322,9 @@ impl<T: std::io::Read> Reader<T> {
             };
 
             let image_desc = BasisLZGlobalDataImageDesc {
-                flags: ImageFlags { bits: this.read_u32()? },
+                flags: ImageFlags {
+                    bits: this.read_u32()?,
+                },
                 rgb_slice_byte_offset: this.read_u32()?,
                 rgb_slice_byte_length: this.read_u32()?,
                 alpha_slice_byte_offset: this.read_u32()?,
@@ -299,8 +336,6 @@ impl<T: std::io::Read> Reader<T> {
             let selectors_data =
                 this.read_vec(global_data_header.selectors_byte_length as usize)?;
             let tables_data = this.read_vec(global_data_header.tables_byte_length as usize)?;
-
-            dbg!(&global_data_header, image_desc);
         }
 
         let start_of_levels = this.read_bytes;
@@ -328,6 +363,8 @@ impl<T: std::io::Read> Reader<T> {
             compressed_images,
             key_values: KeyValues::fetch(&key_values)?,
             custom_key_values: key_values,
+            descriptor_block,
+            samples,
         })
     }
 
@@ -413,8 +450,9 @@ impl KeyValues {
                     let mut chars = string.chars();
 
                     let mut component = || match chars.next() {
-                        Some(character) => SwizzleComponent::parse(character)
-                            .ok_or_else(|| anyhow::anyhow!("Invalid swizzle component")),
+                        Some(character) => SwizzleComponent::parse(character).ok_or_else(|| {
+                            anyhow::anyhow!("Invalid swizzle component: {}", string)
+                        }),
                         None => Err(anyhow::anyhow!("Missing swizzle component")),
                     };
 
@@ -474,6 +512,7 @@ enum SwizzleComponent {
     Red,
     Green,
     Blue,
+    Alpha,
     Zero,
     One,
 }
@@ -484,6 +523,7 @@ impl SwizzleComponent {
             'r' => Some(Self::Red),
             'g' => Some(Self::Green),
             'b' => Some(Self::Blue),
+            'a' => Some(Self::Alpha),
             '0' => Some(Self::Zero),
             '1' => Some(Self::One),
             _ => None,
@@ -511,9 +551,11 @@ enum DepthOrientation {
 
 struct Ktx2 {
     header: Header,
+    descriptor_block: DescriptorBlock,
     compressed_images: Vec<Vec<u8>>,
     key_values: KeyValues,
     custom_key_values: HashMap<String, String>,
+    samples: Vec<SampleInformation>,
 }
 
 impl Ktx2 {
@@ -525,6 +567,51 @@ impl Ktx2 {
                 SupercompressionScheme::Zstandard => Ok(zstd::stream::decode_all(&image[..])?),
                 scheme => panic!("Not supported: {:?}", scheme),
             })
+    }
+
+    fn vk_format(&self) -> VkFormat {
+        if self.header.vk_format != VkFormat::UNDEFINED {
+            self.header.vk_format
+        } else {
+            let mut num_channels = 0;
+
+            for sample in &self.samples {
+                if sample.qualifiers != SampleQualifiers::NONE {
+                    dbg!(sample.qualifiers);
+                }
+
+                match sample.channel_type {
+                    ChannelType::Etc1S(Etc1SChannelType::Rrr)
+                    | ChannelType::Uastc(UastcChannelType::Rrr) => {
+                        num_channels = num_channels.max(1)
+                    }
+                    ChannelType::Etc1S(Etc1SChannelType::Ggg)
+                    | ChannelType::Uastc(UastcChannelType::Rrrg)
+                    | ChannelType::Uastc(UastcChannelType::Rg) => {
+                        num_channels = num_channels.max(2)
+                    }
+                    ChannelType::Etc1S(Etc1SChannelType::Rgb)
+                    | ChannelType::Uastc(UastcChannelType::Rgb) => {
+                        num_channels = num_channels.max(3)
+                    }
+                    ChannelType::Uastc(UastcChannelType::Rgba)
+                    | ChannelType::Etc1S(Etc1SChannelType::Aaa) => {
+                        num_channels = num_channels.max(4)
+                    }
+                    ChannelType::Regular(_) => {
+                        // Not reachable?
+                    }
+                }
+            }
+
+            match num_channels {
+                1 => VkFormat::R8_UNORM,
+                2 => VkFormat::R8G8_UNORM,
+                3 => VkFormat::R8G8B8_UNORM,
+                4 => VkFormat::R8G8B8A8_UNORM,
+                _ => unreachable!(),
+            }
+        }
     }
 }
 
@@ -540,8 +627,8 @@ struct DescriptorBlockHeader {
 #[derive(Debug)]
 struct DescriptorBlock {
     color_model: ColorModel,
+    color_primaries: ColorPrimaries,
     transfer_function: TransferFunction,
-    color_primaries: u8,
     flags: DescriptorBlockFlags,
     texel_block_dimensions: [u8; 4],
     bytes_plane: [u8; 8],
@@ -575,14 +662,28 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug)]
-struct SampleInformation {
+struct RawSampleInformation {
     bit_offset: u16,
     bit_length: u8,
     channel_type_and_qualifiers: u8,
     sample_position: [u8; 4],
-    sample_upper: u32,
     sample_lower: u32,
+    sample_upper: u32,
+}
+
+#[derive(Debug)]
+struct SampleInformation {
+    channel_type: ChannelType,
+    qualifiers: SampleQualifiers,
+    sample_position: [u8; 4],
+    sample_upper: SamplerBound,
+    sample_lower: SamplerBound,
+}
+
+#[derive(Debug)]
+enum SamplerBound {
+    Uint(u32),
+    Float(f32),
 }
 
 #[derive(Debug)]
@@ -610,7 +711,6 @@ bitflags::bitflags! {
         const IS_P_FRAME = 0x02;
     }
 }
-
 
 #[derive(PartialEq, Eq)]
 pub struct ColorModel(u8);
@@ -665,623 +765,117 @@ impl TransferFunction {
 }
 
 bitflags::bitflags! {
-    // https://www.khronos.org/registry/DataFormat/specs/1.3/dataformat.1.3.html#RGBSDAChannels
-    struct ChannelType: u8 {
-        const RED = 0;
-        const GREEN = 1;
-        const BLUE = 2;
-        const STENCIL = 4;
-        const DEPTH = 8;
-        const ALPHA = 16;
+    // https://www.khronos.org/registry/DataFormat/specs/1.3/dataformat.1.3.html#SampleOverview
+    struct SampleQualifiers: u8 {
+        const NONE = 0;
+        const FLOAT = 8;
+        const SIGNED = 4;
+        const EXPONENT = 2;
+        const LINEAR = 1;
     }
 }
 
-impl ChannelType {
-    fn parse(bits: u8) -> Self {
-        match bits {
-            13 => Self::STENCIL,
-            14 => Self::DEPTH,
-            15 => Self::ALPHA,
-            _ => Self { bits },
-        }
-    }
+#[derive(Debug)]
+enum ChannelType {
+    Regular(RegularChannelType),
+    Etc1S(Etc1SChannelType),
+    Uastc(UastcChannelType),
 }
 
-/// This is copied from ash to avoid a dependency.
 #[derive(PartialEq, Eq)]
-pub struct VkFormat(pub u32);
+struct RegularChannelType(u8);
 
-impl VkFormat {
-    pub const UNDEFINED: Self = Self(0);
-    pub const R4G4_UNORM_PACK8: Self = Self(1);
-    pub const R4G4B4A4_UNORM_PACK16: Self = Self(2);
-    pub const B4G4R4A4_UNORM_PACK16: Self = Self(3);
-    pub const R5G6B5_UNORM_PACK16: Self = Self(4);
-    pub const B5G6R5_UNORM_PACK16: Self = Self(5);
-    pub const R5G5B5A1_UNORM_PACK16: Self = Self(6);
-    pub const B5G5R5A1_UNORM_PACK16: Self = Self(7);
-    pub const A1R5G5B5_UNORM_PACK16: Self = Self(8);
-    pub const R8_UNORM: Self = Self(9);
-    pub const R8_SNORM: Self = Self(10);
-    pub const R8_USCALED: Self = Self(11);
-    pub const R8_SSCALED: Self = Self(12);
-    pub const R8_UINT: Self = Self(13);
-    pub const R8_SINT: Self = Self(14);
-    pub const R8_SRGB: Self = Self(15);
-    pub const R8G8_UNORM: Self = Self(16);
-    pub const R8G8_SNORM: Self = Self(17);
-    pub const R8G8_USCALED: Self = Self(18);
-    pub const R8G8_SSCALED: Self = Self(19);
-    pub const R8G8_UINT: Self = Self(20);
-    pub const R8G8_SINT: Self = Self(21);
-    pub const R8G8_SRGB: Self = Self(22);
-    pub const R8G8B8_UNORM: Self = Self(23);
-    pub const R8G8B8_SNORM: Self = Self(24);
-    pub const R8G8B8_USCALED: Self = Self(25);
-    pub const R8G8B8_SSCALED: Self = Self(26);
-    pub const R8G8B8_UINT: Self = Self(27);
-    pub const R8G8B8_SINT: Self = Self(28);
-    pub const R8G8B8_SRGB: Self = Self(29);
-    pub const B8G8R8_UNORM: Self = Self(30);
-    pub const B8G8R8_SNORM: Self = Self(31);
-    pub const B8G8R8_USCALED: Self = Self(32);
-    pub const B8G8R8_SSCALED: Self = Self(33);
-    pub const B8G8R8_UINT: Self = Self(34);
-    pub const B8G8R8_SINT: Self = Self(35);
-    pub const B8G8R8_SRGB: Self = Self(36);
-    pub const R8G8B8A8_UNORM: Self = Self(37);
-    pub const R8G8B8A8_SNORM: Self = Self(38);
-    pub const R8G8B8A8_USCALED: Self = Self(39);
-    pub const R8G8B8A8_SSCALED: Self = Self(40);
-    pub const R8G8B8A8_UINT: Self = Self(41);
-    pub const R8G8B8A8_SINT: Self = Self(42);
-    pub const R8G8B8A8_SRGB: Self = Self(43);
-    pub const B8G8R8A8_UNORM: Self = Self(44);
-    pub const B8G8R8A8_SNORM: Self = Self(45);
-    pub const B8G8R8A8_USCALED: Self = Self(46);
-    pub const B8G8R8A8_SSCALED: Self = Self(47);
-    pub const B8G8R8A8_UINT: Self = Self(48);
-    pub const B8G8R8A8_SINT: Self = Self(49);
-    pub const B8G8R8A8_SRGB: Self = Self(50);
-    pub const A8B8G8R8_UNORM_PACK32: Self = Self(51);
-    pub const A8B8G8R8_SNORM_PACK32: Self = Self(52);
-    pub const A8B8G8R8_USCALED_PACK32: Self = Self(53);
-    pub const A8B8G8R8_SSCALED_PACK32: Self = Self(54);
-    pub const A8B8G8R8_UINT_PACK32: Self = Self(55);
-    pub const A8B8G8R8_SINT_PACK32: Self = Self(56);
-    pub const A8B8G8R8_SRGB_PACK32: Self = Self(57);
-    pub const A2R10G10B10_UNORM_PACK32: Self = Self(58);
-    pub const A2R10G10B10_SNORM_PACK32: Self = Self(59);
-    pub const A2R10G10B10_USCALED_PACK32: Self = Self(60);
-    pub const A2R10G10B10_SSCALED_PACK32: Self = Self(61);
-    pub const A2R10G10B10_UINT_PACK32: Self = Self(62);
-    pub const A2R10G10B10_SINT_PACK32: Self = Self(63);
-    pub const A2B10G10R10_UNORM_PACK32: Self = Self(64);
-    pub const A2B10G10R10_SNORM_PACK32: Self = Self(65);
-    pub const A2B10G10R10_USCALED_PACK32: Self = Self(66);
-    pub const A2B10G10R10_SSCALED_PACK32: Self = Self(67);
-    pub const A2B10G10R10_UINT_PACK32: Self = Self(68);
-    pub const A2B10G10R10_SINT_PACK32: Self = Self(69);
-    pub const R16_UNORM: Self = Self(70);
-    pub const R16_SNORM: Self = Self(71);
-    pub const R16_USCALED: Self = Self(72);
-    pub const R16_SSCALED: Self = Self(73);
-    pub const R16_UINT: Self = Self(74);
-    pub const R16_SINT: Self = Self(75);
-    pub const R16_SFLOAT: Self = Self(76);
-    pub const R16G16_UNORM: Self = Self(77);
-    pub const R16G16_SNORM: Self = Self(78);
-    pub const R16G16_USCALED: Self = Self(79);
-    pub const R16G16_SSCALED: Self = Self(80);
-    pub const R16G16_UINT: Self = Self(81);
-    pub const R16G16_SINT: Self = Self(82);
-    pub const R16G16_SFLOAT: Self = Self(83);
-    pub const R16G16B16_UNORM: Self = Self(84);
-    pub const R16G16B16_SNORM: Self = Self(85);
-    pub const R16G16B16_USCALED: Self = Self(86);
-    pub const R16G16B16_SSCALED: Self = Self(87);
-    pub const R16G16B16_UINT: Self = Self(88);
-    pub const R16G16B16_SINT: Self = Self(89);
-    pub const R16G16B16_SFLOAT: Self = Self(90);
-    pub const R16G16B16A16_UNORM: Self = Self(91);
-    pub const R16G16B16A16_SNORM: Self = Self(92);
-    pub const R16G16B16A16_USCALED: Self = Self(93);
-    pub const R16G16B16A16_SSCALED: Self = Self(94);
-    pub const R16G16B16A16_UINT: Self = Self(95);
-    pub const R16G16B16A16_SINT: Self = Self(96);
-    pub const R16G16B16A16_SFLOAT: Self = Self(97);
-    pub const R32_UINT: Self = Self(98);
-    pub const R32_SINT: Self = Self(99);
-    pub const R32_SFLOAT: Self = Self(100);
-    pub const R32G32_UINT: Self = Self(101);
-    pub const R32G32_SINT: Self = Self(102);
-    pub const R32G32_SFLOAT: Self = Self(103);
-    pub const R32G32B32_UINT: Self = Self(104);
-    pub const R32G32B32_SINT: Self = Self(105);
-    pub const R32G32B32_SFLOAT: Self = Self(106);
-    pub const R32G32B32A32_UINT: Self = Self(107);
-    pub const R32G32B32A32_SINT: Self = Self(108);
-    pub const R32G32B32A32_SFLOAT: Self = Self(109);
-    pub const R64_UINT: Self = Self(110);
-    pub const R64_SINT: Self = Self(111);
-    pub const R64_SFLOAT: Self = Self(112);
-    pub const R64G64_UINT: Self = Self(113);
-    pub const R64G64_SINT: Self = Self(114);
-    pub const R64G64_SFLOAT: Self = Self(115);
-    pub const R64G64B64_UINT: Self = Self(116);
-    pub const R64G64B64_SINT: Self = Self(117);
-    pub const R64G64B64_SFLOAT: Self = Self(118);
-    pub const R64G64B64A64_UINT: Self = Self(119);
-    pub const R64G64B64A64_SINT: Self = Self(120);
-    pub const R64G64B64A64_SFLOAT: Self = Self(121);
-    pub const B10G11R11_UFLOAT_PACK32: Self = Self(122);
-    pub const E5B9G9R9_UFLOAT_PACK32: Self = Self(123);
-    pub const D16_UNORM: Self = Self(124);
-    pub const X8_D24_UNORM_PACK32: Self = Self(125);
-    pub const D32_SFLOAT: Self = Self(126);
-    pub const S8_UINT: Self = Self(127);
-    pub const D16_UNORM_S8_UINT: Self = Self(128);
-    pub const D24_UNORM_S8_UINT: Self = Self(129);
-    pub const D32_SFLOAT_S8_UINT: Self = Self(130);
-    pub const BC1_RGB_UNORM_BLOCK: Self = Self(131);
-    pub const BC1_RGB_SRGB_BLOCK: Self = Self(132);
-    pub const BC1_RGBA_UNORM_BLOCK: Self = Self(133);
-    pub const BC1_RGBA_SRGB_BLOCK: Self = Self(134);
-    pub const BC2_UNORM_BLOCK: Self = Self(135);
-    pub const BC2_SRGB_BLOCK: Self = Self(136);
-    pub const BC3_UNORM_BLOCK: Self = Self(137);
-    pub const BC3_SRGB_BLOCK: Self = Self(138);
-    pub const BC4_UNORM_BLOCK: Self = Self(139);
-    pub const BC4_SNORM_BLOCK: Self = Self(140);
-    pub const BC5_UNORM_BLOCK: Self = Self(141);
-    pub const BC5_SNORM_BLOCK: Self = Self(142);
-    pub const BC6H_UFLOAT_BLOCK: Self = Self(143);
-    pub const BC6H_SFLOAT_BLOCK: Self = Self(144);
-    pub const BC7_UNORM_BLOCK: Self = Self(145);
-    pub const BC7_SRGB_BLOCK: Self = Self(146);
-    pub const ETC2_R8G8B8_UNORM_BLOCK: Self = Self(147);
-    pub const ETC2_R8G8B8_SRGB_BLOCK: Self = Self(148);
-    pub const ETC2_R8G8B8A1_UNORM_BLOCK: Self = Self(149);
-    pub const ETC2_R8G8B8A1_SRGB_BLOCK: Self = Self(150);
-    pub const ETC2_R8G8B8A8_UNORM_BLOCK: Self = Self(151);
-    pub const ETC2_R8G8B8A8_SRGB_BLOCK: Self = Self(152);
-    pub const EAC_R11_UNORM_BLOCK: Self = Self(153);
-    pub const EAC_R11_SNORM_BLOCK: Self = Self(154);
-    pub const EAC_R11G11_UNORM_BLOCK: Self = Self(155);
-    pub const EAC_R11G11_SNORM_BLOCK: Self = Self(156);
-    pub const ASTC_4X4_UNORM_BLOCK: Self = Self(157);
-    pub const ASTC_4X4_SRGB_BLOCK: Self = Self(158);
-    pub const ASTC_5X4_UNORM_BLOCK: Self = Self(159);
-    pub const ASTC_5X4_SRGB_BLOCK: Self = Self(160);
-    pub const ASTC_5X5_UNORM_BLOCK: Self = Self(161);
-    pub const ASTC_5X5_SRGB_BLOCK: Self = Self(162);
-    pub const ASTC_6X5_UNORM_BLOCK: Self = Self(163);
-    pub const ASTC_6X5_SRGB_BLOCK: Self = Self(164);
-    pub const ASTC_6X6_UNORM_BLOCK: Self = Self(165);
-    pub const ASTC_6X6_SRGB_BLOCK: Self = Self(166);
-    pub const ASTC_8X5_UNORM_BLOCK: Self = Self(167);
-    pub const ASTC_8X5_SRGB_BLOCK: Self = Self(168);
-    pub const ASTC_8X6_UNORM_BLOCK: Self = Self(169);
-    pub const ASTC_8X6_SRGB_BLOCK: Self = Self(170);
-    pub const ASTC_8X8_UNORM_BLOCK: Self = Self(171);
-    pub const ASTC_8X8_SRGB_BLOCK: Self = Self(172);
-    pub const ASTC_10X5_UNORM_BLOCK: Self = Self(173);
-    pub const ASTC_10X5_SRGB_BLOCK: Self = Self(174);
-    pub const ASTC_10X6_UNORM_BLOCK: Self = Self(175);
-    pub const ASTC_10X6_SRGB_BLOCK: Self = Self(176);
-    pub const ASTC_10X8_UNORM_BLOCK: Self = Self(177);
-    pub const ASTC_10X8_SRGB_BLOCK: Self = Self(178);
-    pub const ASTC_10X10_UNORM_BLOCK: Self = Self(179);
-    pub const ASTC_10X10_SRGB_BLOCK: Self = Self(180);
-    pub const ASTC_12X10_UNORM_BLOCK: Self = Self(181);
-    pub const ASTC_12X10_SRGB_BLOCK: Self = Self(182);
-    pub const ASTC_12X12_UNORM_BLOCK: Self = Self(183);
-    pub const ASTC_12X12_SRGB_BLOCK: Self = Self(184);
-
-    pub const PVRTC1_2BPP_UNORM_BLOCK_IMG: Self = Self(1_000_054_000);
-    pub const PVRTC1_4BPP_UNORM_BLOCK_IMG: Self = Self(1_000_054_001);
-    pub const PVRTC2_2BPP_UNORM_BLOCK_IMG: Self = Self(1_000_054_002);
-    pub const PVRTC2_4BPP_UNORM_BLOCK_IMG: Self = Self(1_000_054_003);
-    pub const PVRTC1_2BPP_SRGB_BLOCK_IMG: Self = Self(1_000_054_004);
-    pub const PVRTC1_4BPP_SRGB_BLOCK_IMG: Self = Self(1_000_054_005);
-    pub const PVRTC2_2BPP_SRGB_BLOCK_IMG: Self = Self(1_000_054_006);
-    pub const PVRTC2_4BPP_SRGB_BLOCK_IMG: Self = Self(1_000_054_007);
-
-    pub const ASTC_4X4_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_000);
-    pub const ASTC_5X4_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_001);
-    pub const ASTC_5X5_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_002);
-    pub const ASTC_6X5_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_003);
-    pub const ASTC_6X6_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_004);
-    pub const ASTC_8X5_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_005);
-    pub const ASTC_8X6_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_006);
-    pub const ASTC_8X8_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_007);
-    pub const ASTC_10X5_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_008);
-    pub const ASTC_10X6_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_009);
-    pub const ASTC_10X8_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_010);
-    pub const ASTC_10X10_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_011);
-    pub const ASTC_12X10_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_012);
-    pub const ASTC_12X12_SFLOAT_BLOCK_EXT: Self = Self(1_000_066_013);
-
-    pub const G8B8G8R8_422_UNORM: Self = Self(1_000_156_000);
-    pub const B8G8R8G8_422_UNORM: Self = Self(1_000_156_001);
-    pub const G8_B8_R8_3PLANE_420_UNORM: Self = Self(1_000_156_002);
-    pub const G8_B8R8_2PLANE_420_UNORM: Self = Self(1_000_156_003);
-    pub const G8_B8_R8_3PLANE_422_UNORM: Self = Self(1_000_156_004);
-    pub const G8_B8R8_2PLANE_422_UNORM: Self = Self(1_000_156_005);
-    pub const G8_B8_R8_3PLANE_444_UNORM: Self = Self(1_000_156_006);
-    pub const R10X6_UNORM_PACK16: Self = Self(1_000_156_007);
-    pub const R10X6G10X6_UNORM_2PACK16: Self = Self(1_000_156_008);
-    pub const R10X6G10X6B10X6A10X6_UNORM_4PACK16: Self = Self(1_000_156_009);
-    pub const G10X6B10X6G10X6R10X6_422_UNORM_4PACK16: Self = Self(1_000_156_010);
-    pub const B10X6G10X6R10X6G10X6_422_UNORM_4PACK16: Self = Self(1_000_156_011);
-    pub const G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16: Self = Self(1_000_156_012);
-    pub const G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16: Self = Self(1_000_156_013);
-    pub const G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16: Self = Self(1_000_156_014);
-    pub const G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16: Self = Self(1_000_156_015);
-    pub const G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16: Self = Self(1_000_156_016);
-    pub const R12X4_UNORM_PACK16: Self = Self(1_000_156_017);
-    pub const R12X4G12X4_UNORM_2PACK16: Self = Self(1_000_156_018);
-    pub const R12X4G12X4B12X4A12X4_UNORM_4PACK16: Self = Self(1_000_156_019);
-    pub const G12X4B12X4G12X4R12X4_422_UNORM_4PACK16: Self = Self(1_000_156_020);
-    pub const B12X4G12X4R12X4G12X4_422_UNORM_4PACK16: Self = Self(1_000_156_021);
-    pub const G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16: Self = Self(1_000_156_022);
-    pub const G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16: Self = Self(1_000_156_023);
-    pub const G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16: Self = Self(1_000_156_024);
-    pub const G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16: Self = Self(1_000_156_025);
-    pub const G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16: Self = Self(1_000_156_026);
-    pub const G16B16G16R16_422_UNORM: Self = Self(1_000_156_027);
-    pub const B16G16R16G16_422_UNORM: Self = Self(1_000_156_028);
-    pub const G16_B16_R16_3PLANE_420_UNORM: Self = Self(1_000_156_029);
-    pub const G16_B16R16_2PLANE_420_UNORM: Self = Self(1_000_156_030);
-    pub const G16_B16_R16_3PLANE_422_UNORM: Self = Self(1_000_156_031);
-    pub const G16_B16R16_2PLANE_422_UNORM: Self = Self(1_000_156_032);
-    pub const G16_B16_R16_3PLANE_444_UNORM: Self = Self(1_000_156_033);
-
-    pub const ASTC_3X3X3_UNORM_BLOCK_EXT: Self = Self(1_000_288_000);
-    pub const ASTC_3X3X3_SRGB_BLOCK_EXT: Self = Self(1_000_288_001);
-    pub const ASTC_3X3X3_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_002);
-    pub const ASTC_4X3X3_UNORM_BLOCK_EXT: Self = Self(1_000_288_003);
-    pub const ASTC_4X3X3_SRGB_BLOCK_EXT: Self = Self(1_000_288_004);
-    pub const ASTC_4X3X3_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_005);
-    pub const ASTC_4X4X3_UNORM_BLOCK_EXT: Self = Self(1_000_288_006);
-    pub const ASTC_4X4X3_SRGB_BLOCK_EXT: Self = Self(1_000_288_007);
-    pub const ASTC_4X4X3_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_008);
-    pub const ASTC_4X4X4_UNORM_BLOCK_EXT: Self = Self(1_000_288_009);
-    pub const ASTC_4X4X4_SRGB_BLOCK_EXT: Self = Self(1_000_288_010);
-    pub const ASTC_4X4X4_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_011);
-    pub const ASTC_5X4X4_UNORM_BLOCK_EXT: Self = Self(1_000_288_012);
-    pub const ASTC_5X4X4_SRGB_BLOCK_EXT: Self = Self(1_000_288_013);
-    pub const ASTC_5X4X4_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_014);
-    pub const ASTC_5X5X4_UNORM_BLOCK_EXT: Self = Self(1_000_288_015);
-    pub const ASTC_5X5X4_SRGB_BLOCK_EXT: Self = Self(1_000_288_016);
-    pub const ASTC_5X5X4_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_017);
-    pub const ASTC_5X5X5_UNORM_BLOCK_EXT: Self = Self(1_000_288_018);
-    pub const ASTC_5X5X5_SRGB_BLOCK_EXT: Self = Self(1_000_288_019);
-    pub const ASTC_5X5X5_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_020);
-    pub const ASTC_6X5X5_UNORM_BLOCK_EXT: Self = Self(1_000_288_021);
-    pub const ASTC_6X5X5_SRGB_BLOCK_EXT: Self = Self(1_000_288_022);
-    pub const ASTC_6X5X5_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_023);
-    pub const ASTC_6X6X5_UNORM_BLOCK_EXT: Self = Self(1_000_288_024);
-    pub const ASTC_6X6X5_SRGB_BLOCK_EXT: Self = Self(1_000_288_025);
-    pub const ASTC_6X6X5_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_026);
-    pub const ASTC_6X6X6_UNORM_BLOCK_EXT: Self = Self(1_000_288_027);
-    pub const ASTC_6X6X6_SRGB_BLOCK_EXT: Self = Self(1_000_288_028);
-    pub const ASTC_6X6X6_SFLOAT_BLOCK_EXT: Self = Self(1_000_288_029);
-
-    pub const A4R4G4B4_UNORM_PACK16_EXT: Self = Self(1_000_340_000);
-    pub const A4B4G4R4_UNORM_PACK16_EXT: Self = Self(1_000_340_001);
+// https://www.khronos.org/registry/DataFormat/specs/1.3/dataformat.1.3.html#RGBSDAChannels
+// extended by:
+// https://github.khronos.org/KTX-Specification/#etc1s
+impl RegularChannelType {
+    pub const RED: Self = Self(0);
+    pub const GREEN: Self = Self(1);
+    pub const BLUE: Self = Self(2);
+    pub const RRR: Self = Self(3);
+    pub const GGG: Self = Self(4);
+    pub const STENCIL: Self = Self(13);
+    pub const DEPTH: Self = Self(14);
+    pub const ALPHA: Self = Self(15);
 }
 
-impl fmt::Debug for VkFormat {
+impl fmt::Debug for RegularChannelType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let name = match *self {
-            Self::UNDEFINED => Some("UNDEFINED"),
-            Self::R4G4_UNORM_PACK8 => Some("R4G4_UNORM_PACK8"),
-            Self::R4G4B4A4_UNORM_PACK16 => Some("R4G4B4A4_UNORM_PACK16"),
-            Self::B4G4R4A4_UNORM_PACK16 => Some("B4G4R4A4_UNORM_PACK16"),
-            Self::R5G6B5_UNORM_PACK16 => Some("R5G6B5_UNORM_PACK16"),
-            Self::B5G6R5_UNORM_PACK16 => Some("B5G6R5_UNORM_PACK16"),
-            Self::R5G5B5A1_UNORM_PACK16 => Some("R5G5B5A1_UNORM_PACK16"),
-            Self::B5G5R5A1_UNORM_PACK16 => Some("B5G5R5A1_UNORM_PACK16"),
-            Self::A1R5G5B5_UNORM_PACK16 => Some("A1R5G5B5_UNORM_PACK16"),
-            Self::R8_UNORM => Some("R8_UNORM"),
-            Self::R8_SNORM => Some("R8_SNORM"),
-            Self::R8_USCALED => Some("R8_USCALED"),
-            Self::R8_SSCALED => Some("R8_SSCALED"),
-            Self::R8_UINT => Some("R8_UINT"),
-            Self::R8_SINT => Some("R8_SINT"),
-            Self::R8_SRGB => Some("R8_SRGB"),
-            Self::R8G8_UNORM => Some("R8G8_UNORM"),
-            Self::R8G8_SNORM => Some("R8G8_SNORM"),
-            Self::R8G8_USCALED => Some("R8G8_USCALED"),
-            Self::R8G8_SSCALED => Some("R8G8_SSCALED"),
-            Self::R8G8_UINT => Some("R8G8_UINT"),
-            Self::R8G8_SINT => Some("R8G8_SINT"),
-            Self::R8G8_SRGB => Some("R8G8_SRGB"),
-            Self::R8G8B8_UNORM => Some("R8G8B8_UNORM"),
-            Self::R8G8B8_SNORM => Some("R8G8B8_SNORM"),
-            Self::R8G8B8_USCALED => Some("R8G8B8_USCALED"),
-            Self::R8G8B8_SSCALED => Some("R8G8B8_SSCALED"),
-            Self::R8G8B8_UINT => Some("R8G8B8_UINT"),
-            Self::R8G8B8_SINT => Some("R8G8B8_SINT"),
-            Self::R8G8B8_SRGB => Some("R8G8B8_SRGB"),
-            Self::B8G8R8_UNORM => Some("B8G8R8_UNORM"),
-            Self::B8G8R8_SNORM => Some("B8G8R8_SNORM"),
-            Self::B8G8R8_USCALED => Some("B8G8R8_USCALED"),
-            Self::B8G8R8_SSCALED => Some("B8G8R8_SSCALED"),
-            Self::B8G8R8_UINT => Some("B8G8R8_UINT"),
-            Self::B8G8R8_SINT => Some("B8G8R8_SINT"),
-            Self::B8G8R8_SRGB => Some("B8G8R8_SRGB"),
-            Self::R8G8B8A8_UNORM => Some("R8G8B8A8_UNORM"),
-            Self::R8G8B8A8_SNORM => Some("R8G8B8A8_SNORM"),
-            Self::R8G8B8A8_USCALED => Some("R8G8B8A8_USCALED"),
-            Self::R8G8B8A8_SSCALED => Some("R8G8B8A8_SSCALED"),
-            Self::R8G8B8A8_UINT => Some("R8G8B8A8_UINT"),
-            Self::R8G8B8A8_SINT => Some("R8G8B8A8_SINT"),
-            Self::R8G8B8A8_SRGB => Some("R8G8B8A8_SRGB"),
-            Self::B8G8R8A8_UNORM => Some("B8G8R8A8_UNORM"),
-            Self::B8G8R8A8_SNORM => Some("B8G8R8A8_SNORM"),
-            Self::B8G8R8A8_USCALED => Some("B8G8R8A8_USCALED"),
-            Self::B8G8R8A8_SSCALED => Some("B8G8R8A8_SSCALED"),
-            Self::B8G8R8A8_UINT => Some("B8G8R8A8_UINT"),
-            Self::B8G8R8A8_SINT => Some("B8G8R8A8_SINT"),
-            Self::B8G8R8A8_SRGB => Some("B8G8R8A8_SRGB"),
-            Self::A8B8G8R8_UNORM_PACK32 => Some("A8B8G8R8_UNORM_PACK32"),
-            Self::A8B8G8R8_SNORM_PACK32 => Some("A8B8G8R8_SNORM_PACK32"),
-            Self::A8B8G8R8_USCALED_PACK32 => Some("A8B8G8R8_USCALED_PACK32"),
-            Self::A8B8G8R8_SSCALED_PACK32 => Some("A8B8G8R8_SSCALED_PACK32"),
-            Self::A8B8G8R8_UINT_PACK32 => Some("A8B8G8R8_UINT_PACK32"),
-            Self::A8B8G8R8_SINT_PACK32 => Some("A8B8G8R8_SINT_PACK32"),
-            Self::A8B8G8R8_SRGB_PACK32 => Some("A8B8G8R8_SRGB_PACK32"),
-            Self::A2R10G10B10_UNORM_PACK32 => Some("A2R10G10B10_UNORM_PACK32"),
-            Self::A2R10G10B10_SNORM_PACK32 => Some("A2R10G10B10_SNORM_PACK32"),
-            Self::A2R10G10B10_USCALED_PACK32 => Some("A2R10G10B10_USCALED_PACK32"),
-            Self::A2R10G10B10_SSCALED_PACK32 => Some("A2R10G10B10_SSCALED_PACK32"),
-            Self::A2R10G10B10_UINT_PACK32 => Some("A2R10G10B10_UINT_PACK32"),
-            Self::A2R10G10B10_SINT_PACK32 => Some("A2R10G10B10_SINT_PACK32"),
-            Self::A2B10G10R10_UNORM_PACK32 => Some("A2B10G10R10_UNORM_PACK32"),
-            Self::A2B10G10R10_SNORM_PACK32 => Some("A2B10G10R10_SNORM_PACK32"),
-            Self::A2B10G10R10_USCALED_PACK32 => Some("A2B10G10R10_USCALED_PACK32"),
-            Self::A2B10G10R10_SSCALED_PACK32 => Some("A2B10G10R10_SSCALED_PACK32"),
-            Self::A2B10G10R10_UINT_PACK32 => Some("A2B10G10R10_UINT_PACK32"),
-            Self::A2B10G10R10_SINT_PACK32 => Some("A2B10G10R10_SINT_PACK32"),
-            Self::R16_UNORM => Some("R16_UNORM"),
-            Self::R16_SNORM => Some("R16_SNORM"),
-            Self::R16_USCALED => Some("R16_USCALED"),
-            Self::R16_SSCALED => Some("R16_SSCALED"),
-            Self::R16_UINT => Some("R16_UINT"),
-            Self::R16_SINT => Some("R16_SINT"),
-            Self::R16_SFLOAT => Some("R16_SFLOAT"),
-            Self::R16G16_UNORM => Some("R16G16_UNORM"),
-            Self::R16G16_SNORM => Some("R16G16_SNORM"),
-            Self::R16G16_USCALED => Some("R16G16_USCALED"),
-            Self::R16G16_SSCALED => Some("R16G16_SSCALED"),
-            Self::R16G16_UINT => Some("R16G16_UINT"),
-            Self::R16G16_SINT => Some("R16G16_SINT"),
-            Self::R16G16_SFLOAT => Some("R16G16_SFLOAT"),
-            Self::R16G16B16_UNORM => Some("R16G16B16_UNORM"),
-            Self::R16G16B16_SNORM => Some("R16G16B16_SNORM"),
-            Self::R16G16B16_USCALED => Some("R16G16B16_USCALED"),
-            Self::R16G16B16_SSCALED => Some("R16G16B16_SSCALED"),
-            Self::R16G16B16_UINT => Some("R16G16B16_UINT"),
-            Self::R16G16B16_SINT => Some("R16G16B16_SINT"),
-            Self::R16G16B16_SFLOAT => Some("R16G16B16_SFLOAT"),
-            Self::R16G16B16A16_UNORM => Some("R16G16B16A16_UNORM"),
-            Self::R16G16B16A16_SNORM => Some("R16G16B16A16_SNORM"),
-            Self::R16G16B16A16_USCALED => Some("R16G16B16A16_USCALED"),
-            Self::R16G16B16A16_SSCALED => Some("R16G16B16A16_SSCALED"),
-            Self::R16G16B16A16_UINT => Some("R16G16B16A16_UINT"),
-            Self::R16G16B16A16_SINT => Some("R16G16B16A16_SINT"),
-            Self::R16G16B16A16_SFLOAT => Some("R16G16B16A16_SFLOAT"),
-            Self::R32_UINT => Some("R32_UINT"),
-            Self::R32_SINT => Some("R32_SINT"),
-            Self::R32_SFLOAT => Some("R32_SFLOAT"),
-            Self::R32G32_UINT => Some("R32G32_UINT"),
-            Self::R32G32_SINT => Some("R32G32_SINT"),
-            Self::R32G32_SFLOAT => Some("R32G32_SFLOAT"),
-            Self::R32G32B32_UINT => Some("R32G32B32_UINT"),
-            Self::R32G32B32_SINT => Some("R32G32B32_SINT"),
-            Self::R32G32B32_SFLOAT => Some("R32G32B32_SFLOAT"),
-            Self::R32G32B32A32_UINT => Some("R32G32B32A32_UINT"),
-            Self::R32G32B32A32_SINT => Some("R32G32B32A32_SINT"),
-            Self::R32G32B32A32_SFLOAT => Some("R32G32B32A32_SFLOAT"),
-            Self::R64_UINT => Some("R64_UINT"),
-            Self::R64_SINT => Some("R64_SINT"),
-            Self::R64_SFLOAT => Some("R64_SFLOAT"),
-            Self::R64G64_UINT => Some("R64G64_UINT"),
-            Self::R64G64_SINT => Some("R64G64_SINT"),
-            Self::R64G64_SFLOAT => Some("R64G64_SFLOAT"),
-            Self::R64G64B64_UINT => Some("R64G64B64_UINT"),
-            Self::R64G64B64_SINT => Some("R64G64B64_SINT"),
-            Self::R64G64B64_SFLOAT => Some("R64G64B64_SFLOAT"),
-            Self::R64G64B64A64_UINT => Some("R64G64B64A64_UINT"),
-            Self::R64G64B64A64_SINT => Some("R64G64B64A64_SINT"),
-            Self::R64G64B64A64_SFLOAT => Some("R64G64B64A64_SFLOAT"),
-            Self::B10G11R11_UFLOAT_PACK32 => Some("B10G11R11_UFLOAT_PACK32"),
-            Self::E5B9G9R9_UFLOAT_PACK32 => Some("E5B9G9R9_UFLOAT_PACK32"),
-            Self::D16_UNORM => Some("D16_UNORM"),
-            Self::X8_D24_UNORM_PACK32 => Some("X8_D24_UNORM_PACK32"),
-            Self::D32_SFLOAT => Some("D32_SFLOAT"),
-            Self::S8_UINT => Some("S8_UINT"),
-            Self::D16_UNORM_S8_UINT => Some("D16_UNORM_S8_UINT"),
-            Self::D24_UNORM_S8_UINT => Some("D24_UNORM_S8_UINT"),
-            Self::D32_SFLOAT_S8_UINT => Some("D32_SFLOAT_S8_UINT"),
-            Self::BC1_RGB_UNORM_BLOCK => Some("BC1_RGB_UNORM_BLOCK"),
-            Self::BC1_RGB_SRGB_BLOCK => Some("BC1_RGB_SRGB_BLOCK"),
-            Self::BC1_RGBA_UNORM_BLOCK => Some("BC1_RGBA_UNORM_BLOCK"),
-            Self::BC1_RGBA_SRGB_BLOCK => Some("BC1_RGBA_SRGB_BLOCK"),
-            Self::BC2_UNORM_BLOCK => Some("BC2_UNORM_BLOCK"),
-            Self::BC2_SRGB_BLOCK => Some("BC2_SRGB_BLOCK"),
-            Self::BC3_UNORM_BLOCK => Some("BC3_UNORM_BLOCK"),
-            Self::BC3_SRGB_BLOCK => Some("BC3_SRGB_BLOCK"),
-            Self::BC4_UNORM_BLOCK => Some("BC4_UNORM_BLOCK"),
-            Self::BC4_SNORM_BLOCK => Some("BC4_SNORM_BLOCK"),
-            Self::BC5_UNORM_BLOCK => Some("BC5_UNORM_BLOCK"),
-            Self::BC5_SNORM_BLOCK => Some("BC5_SNORM_BLOCK"),
-            Self::BC6H_UFLOAT_BLOCK => Some("BC6H_UFLOAT_BLOCK"),
-            Self::BC6H_SFLOAT_BLOCK => Some("BC6H_SFLOAT_BLOCK"),
-            Self::BC7_UNORM_BLOCK => Some("BC7_UNORM_BLOCK"),
-            Self::BC7_SRGB_BLOCK => Some("BC7_SRGB_BLOCK"),
-            Self::ETC2_R8G8B8_UNORM_BLOCK => Some("ETC2_R8G8B8_UNORM_BLOCK"),
-            Self::ETC2_R8G8B8_SRGB_BLOCK => Some("ETC2_R8G8B8_SRGB_BLOCK"),
-            Self::ETC2_R8G8B8A1_UNORM_BLOCK => Some("ETC2_R8G8B8A1_UNORM_BLOCK"),
-            Self::ETC2_R8G8B8A1_SRGB_BLOCK => Some("ETC2_R8G8B8A1_SRGB_BLOCK"),
-            Self::ETC2_R8G8B8A8_UNORM_BLOCK => Some("ETC2_R8G8B8A8_UNORM_BLOCK"),
-            Self::ETC2_R8G8B8A8_SRGB_BLOCK => Some("ETC2_R8G8B8A8_SRGB_BLOCK"),
-            Self::EAC_R11_UNORM_BLOCK => Some("EAC_R11_UNORM_BLOCK"),
-            Self::EAC_R11_SNORM_BLOCK => Some("EAC_R11_SNORM_BLOCK"),
-            Self::EAC_R11G11_UNORM_BLOCK => Some("EAC_R11G11_UNORM_BLOCK"),
-            Self::EAC_R11G11_SNORM_BLOCK => Some("EAC_R11G11_SNORM_BLOCK"),
-            Self::ASTC_4X4_UNORM_BLOCK => Some("ASTC_4X4_UNORM_BLOCK"),
-            Self::ASTC_4X4_SRGB_BLOCK => Some("ASTC_4X4_SRGB_BLOCK"),
-            Self::ASTC_5X4_UNORM_BLOCK => Some("ASTC_5X4_UNORM_BLOCK"),
-            Self::ASTC_5X4_SRGB_BLOCK => Some("ASTC_5X4_SRGB_BLOCK"),
-            Self::ASTC_5X5_UNORM_BLOCK => Some("ASTC_5X5_UNORM_BLOCK"),
-            Self::ASTC_5X5_SRGB_BLOCK => Some("ASTC_5X5_SRGB_BLOCK"),
-            Self::ASTC_6X5_UNORM_BLOCK => Some("ASTC_6X5_UNORM_BLOCK"),
-            Self::ASTC_6X5_SRGB_BLOCK => Some("ASTC_6X5_SRGB_BLOCK"),
-            Self::ASTC_6X6_UNORM_BLOCK => Some("ASTC_6X6_UNORM_BLOCK"),
-            Self::ASTC_6X6_SRGB_BLOCK => Some("ASTC_6X6_SRGB_BLOCK"),
-            Self::ASTC_8X5_UNORM_BLOCK => Some("ASTC_8X5_UNORM_BLOCK"),
-            Self::ASTC_8X5_SRGB_BLOCK => Some("ASTC_8X5_SRGB_BLOCK"),
-            Self::ASTC_8X6_UNORM_BLOCK => Some("ASTC_8X6_UNORM_BLOCK"),
-            Self::ASTC_8X6_SRGB_BLOCK => Some("ASTC_8X6_SRGB_BLOCK"),
-            Self::ASTC_8X8_UNORM_BLOCK => Some("ASTC_8X8_UNORM_BLOCK"),
-            Self::ASTC_8X8_SRGB_BLOCK => Some("ASTC_8X8_SRGB_BLOCK"),
-            Self::ASTC_10X5_UNORM_BLOCK => Some("ASTC_10X5_UNORM_BLOCK"),
-            Self::ASTC_10X5_SRGB_BLOCK => Some("ASTC_10X5_SRGB_BLOCK"),
-            Self::ASTC_10X6_UNORM_BLOCK => Some("ASTC_10X6_UNORM_BLOCK"),
-            Self::ASTC_10X6_SRGB_BLOCK => Some("ASTC_10X6_SRGB_BLOCK"),
-            Self::ASTC_10X8_UNORM_BLOCK => Some("ASTC_10X8_UNORM_BLOCK"),
-            Self::ASTC_10X8_SRGB_BLOCK => Some("ASTC_10X8_SRGB_BLOCK"),
-            Self::ASTC_10X10_UNORM_BLOCK => Some("ASTC_10X10_UNORM_BLOCK"),
-            Self::ASTC_10X10_SRGB_BLOCK => Some("ASTC_10X10_SRGB_BLOCK"),
-            Self::ASTC_12X10_UNORM_BLOCK => Some("ASTC_12X10_UNORM_BLOCK"),
-            Self::ASTC_12X10_SRGB_BLOCK => Some("ASTC_12X10_SRGB_BLOCK"),
-            Self::ASTC_12X12_UNORM_BLOCK => Some("ASTC_12X12_UNORM_BLOCK"),
-            Self::ASTC_12X12_SRGB_BLOCK => Some("ASTC_12X12_SRGB_BLOCK"),
-            Self::PVRTC1_2BPP_UNORM_BLOCK_IMG => Some("PVRTC1_2BPP_UNORM_BLOCK_IMG"),
-            Self::PVRTC1_4BPP_UNORM_BLOCK_IMG => Some("PVRTC1_4BPP_UNORM_BLOCK_IMG"),
-            Self::PVRTC2_2BPP_UNORM_BLOCK_IMG => Some("PVRTC2_2BPP_UNORM_BLOCK_IMG"),
-            Self::PVRTC2_4BPP_UNORM_BLOCK_IMG => Some("PVRTC2_4BPP_UNORM_BLOCK_IMG"),
-            Self::PVRTC1_2BPP_SRGB_BLOCK_IMG => Some("PVRTC1_2BPP_SRGB_BLOCK_IMG"),
-            Self::PVRTC1_4BPP_SRGB_BLOCK_IMG => Some("PVRTC1_4BPP_SRGB_BLOCK_IMG"),
-            Self::PVRTC2_2BPP_SRGB_BLOCK_IMG => Some("PVRTC2_2BPP_SRGB_BLOCK_IMG"),
-            Self::PVRTC2_4BPP_SRGB_BLOCK_IMG => Some("PVRTC2_4BPP_SRGB_BLOCK_IMG"),
-            Self::ASTC_4X4_SFLOAT_BLOCK_EXT => Some("ASTC_4X4_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_5X4_SFLOAT_BLOCK_EXT => Some("ASTC_5X4_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_5X5_SFLOAT_BLOCK_EXT => Some("ASTC_5X5_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_6X5_SFLOAT_BLOCK_EXT => Some("ASTC_6X5_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_6X6_SFLOAT_BLOCK_EXT => Some("ASTC_6X6_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_8X5_SFLOAT_BLOCK_EXT => Some("ASTC_8X5_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_8X6_SFLOAT_BLOCK_EXT => Some("ASTC_8X6_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_8X8_SFLOAT_BLOCK_EXT => Some("ASTC_8X8_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_10X5_SFLOAT_BLOCK_EXT => Some("ASTC_10X5_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_10X6_SFLOAT_BLOCK_EXT => Some("ASTC_10X6_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_10X8_SFLOAT_BLOCK_EXT => Some("ASTC_10X8_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_10X10_SFLOAT_BLOCK_EXT => Some("ASTC_10X10_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_12X10_SFLOAT_BLOCK_EXT => Some("ASTC_12X10_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_12X12_SFLOAT_BLOCK_EXT => Some("ASTC_12X12_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_3X3X3_UNORM_BLOCK_EXT => Some("ASTC_3X3X3_UNORM_BLOCK_EXT"),
-            Self::ASTC_3X3X3_SRGB_BLOCK_EXT => Some("ASTC_3X3X3_SRGB_BLOCK_EXT"),
-            Self::ASTC_3X3X3_SFLOAT_BLOCK_EXT => Some("ASTC_3X3X3_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_4X3X3_UNORM_BLOCK_EXT => Some("ASTC_4X3X3_UNORM_BLOCK_EXT"),
-            Self::ASTC_4X3X3_SRGB_BLOCK_EXT => Some("ASTC_4X3X3_SRGB_BLOCK_EXT"),
-            Self::ASTC_4X3X3_SFLOAT_BLOCK_EXT => Some("ASTC_4X3X3_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_4X4X3_UNORM_BLOCK_EXT => Some("ASTC_4X4X3_UNORM_BLOCK_EXT"),
-            Self::ASTC_4X4X3_SRGB_BLOCK_EXT => Some("ASTC_4X4X3_SRGB_BLOCK_EXT"),
-            Self::ASTC_4X4X3_SFLOAT_BLOCK_EXT => Some("ASTC_4X4X3_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_4X4X4_UNORM_BLOCK_EXT => Some("ASTC_4X4X4_UNORM_BLOCK_EXT"),
-            Self::ASTC_4X4X4_SRGB_BLOCK_EXT => Some("ASTC_4X4X4_SRGB_BLOCK_EXT"),
-            Self::ASTC_4X4X4_SFLOAT_BLOCK_EXT => Some("ASTC_4X4X4_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_5X4X4_UNORM_BLOCK_EXT => Some("ASTC_5X4X4_UNORM_BLOCK_EXT"),
-            Self::ASTC_5X4X4_SRGB_BLOCK_EXT => Some("ASTC_5X4X4_SRGB_BLOCK_EXT"),
-            Self::ASTC_5X4X4_SFLOAT_BLOCK_EXT => Some("ASTC_5X4X4_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_5X5X4_UNORM_BLOCK_EXT => Some("ASTC_5X5X4_UNORM_BLOCK_EXT"),
-            Self::ASTC_5X5X4_SRGB_BLOCK_EXT => Some("ASTC_5X5X4_SRGB_BLOCK_EXT"),
-            Self::ASTC_5X5X4_SFLOAT_BLOCK_EXT => Some("ASTC_5X5X4_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_5X5X5_UNORM_BLOCK_EXT => Some("ASTC_5X5X5_UNORM_BLOCK_EXT"),
-            Self::ASTC_5X5X5_SRGB_BLOCK_EXT => Some("ASTC_5X5X5_SRGB_BLOCK_EXT"),
-            Self::ASTC_5X5X5_SFLOAT_BLOCK_EXT => Some("ASTC_5X5X5_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_6X5X5_UNORM_BLOCK_EXT => Some("ASTC_6X5X5_UNORM_BLOCK_EXT"),
-            Self::ASTC_6X5X5_SRGB_BLOCK_EXT => Some("ASTC_6X5X5_SRGB_BLOCK_EXT"),
-            Self::ASTC_6X5X5_SFLOAT_BLOCK_EXT => Some("ASTC_6X5X5_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_6X6X5_UNORM_BLOCK_EXT => Some("ASTC_6X6X5_UNORM_BLOCK_EXT"),
-            Self::ASTC_6X6X5_SRGB_BLOCK_EXT => Some("ASTC_6X6X5_SRGB_BLOCK_EXT"),
-            Self::ASTC_6X6X5_SFLOAT_BLOCK_EXT => Some("ASTC_6X6X5_SFLOAT_BLOCK_EXT"),
-            Self::ASTC_6X6X6_UNORM_BLOCK_EXT => Some("ASTC_6X6X6_UNORM_BLOCK_EXT"),
-            Self::ASTC_6X6X6_SRGB_BLOCK_EXT => Some("ASTC_6X6X6_SRGB_BLOCK_EXT"),
-            Self::ASTC_6X6X6_SFLOAT_BLOCK_EXT => Some("ASTC_6X6X6_SFLOAT_BLOCK_EXT"),
-            Self::A4R4G4B4_UNORM_PACK16_EXT => Some("A4R4G4B4_UNORM_PACK16_EXT"),
-            Self::A4B4G4R4_UNORM_PACK16_EXT => Some("A4B4G4R4_UNORM_PACK16_EXT"),
-            Self::G8B8G8R8_422_UNORM => Some("G8B8G8R8_422_UNORM"),
-            Self::B8G8R8G8_422_UNORM => Some("B8G8R8G8_422_UNORM"),
-            Self::G8_B8_R8_3PLANE_420_UNORM => Some("G8_B8_R8_3PLANE_420_UNORM"),
-            Self::G8_B8R8_2PLANE_420_UNORM => Some("G8_B8R8_2PLANE_420_UNORM"),
-            Self::G8_B8_R8_3PLANE_422_UNORM => Some("G8_B8_R8_3PLANE_422_UNORM"),
-            Self::G8_B8R8_2PLANE_422_UNORM => Some("G8_B8R8_2PLANE_422_UNORM"),
-            Self::G8_B8_R8_3PLANE_444_UNORM => Some("G8_B8_R8_3PLANE_444_UNORM"),
-            Self::R10X6_UNORM_PACK16 => Some("R10X6_UNORM_PACK16"),
-            Self::R10X6G10X6_UNORM_2PACK16 => Some("R10X6G10X6_UNORM_2PACK16"),
-            Self::R10X6G10X6B10X6A10X6_UNORM_4PACK16 => Some("R10X6G10X6B10X6A10X6_UNORM_4PACK16"),
-            Self::G10X6B10X6G10X6R10X6_422_UNORM_4PACK16 => {
-                Some("G10X6B10X6G10X6R10X6_422_UNORM_4PACK16")
-            }
-            Self::B10X6G10X6R10X6G10X6_422_UNORM_4PACK16 => {
-                Some("B10X6G10X6R10X6G10X6_422_UNORM_4PACK16")
-            }
-            Self::G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16 => {
-                Some("G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16")
-            }
-            Self::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 => {
-                Some("G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16")
-            }
-            Self::G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16 => {
-                Some("G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16")
-            }
-            Self::G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16 => {
-                Some("G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16")
-            }
-            Self::G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16 => {
-                Some("G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16")
-            }
-            Self::R12X4_UNORM_PACK16 => Some("R12X4_UNORM_PACK16"),
-            Self::R12X4G12X4_UNORM_2PACK16 => Some("R12X4G12X4_UNORM_2PACK16"),
-            Self::R12X4G12X4B12X4A12X4_UNORM_4PACK16 => Some("R12X4G12X4B12X4A12X4_UNORM_4PACK16"),
-            Self::G12X4B12X4G12X4R12X4_422_UNORM_4PACK16 => {
-                Some("G12X4B12X4G12X4R12X4_422_UNORM_4PACK16")
-            }
-            Self::B12X4G12X4R12X4G12X4_422_UNORM_4PACK16 => {
-                Some("B12X4G12X4R12X4G12X4_422_UNORM_4PACK16")
-            }
-            Self::G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16 => {
-                Some("G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16")
-            }
-            Self::G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16 => {
-                Some("G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16")
-            }
-            Self::G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16 => {
-                Some("G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16")
-            }
-            Self::G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16 => {
-                Some("G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16")
-            }
-            Self::G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16 => {
-                Some("G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16")
-            }
-            Self::G16B16G16R16_422_UNORM => Some("G16B16G16R16_422_UNORM"),
-            Self::B16G16R16G16_422_UNORM => Some("B16G16R16G16_422_UNORM"),
-            Self::G16_B16_R16_3PLANE_420_UNORM => Some("G16_B16_R16_3PLANE_420_UNORM"),
-            Self::G16_B16R16_2PLANE_420_UNORM => Some("G16_B16R16_2PLANE_420_UNORM"),
-            Self::G16_B16_R16_3PLANE_422_UNORM => Some("G16_B16_R16_3PLANE_422_UNORM"),
-            Self::G16_B16R16_2PLANE_422_UNORM => Some("G16_B16R16_2PLANE_422_UNORM"),
-            Self::G16_B16_R16_3PLANE_444_UNORM => Some("G16_B16_R16_3PLANE_444_UNORM"),
+            Self::RED => Some("RED"),
+            Self::GREEN => Some("GREEN"),
+            Self::BLUE => Some("BLUE"),
+            Self::RRR => Some("RRR"),
+            Self::GGG => Some("GGG"),
+            Self::STENCIL => Some("STENCIL"),
+            Self::DEPTH => Some("DEPTH"),
+            Self::ALPHA => Some("ALPHA"),
             _ => None,
         };
+
         if let Some(x) = name {
             f.write_str(x)
         } else {
             self.0.fmt(f)
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Etc1SChannelType {
+    Rgb = 0,
+    Rrr = 3,
+    Ggg = 4,
+    Aaa = 15,
+}
+
+impl Etc1SChannelType {
+    fn parse(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Rgb),
+            3 => Some(Self::Rrr),
+            4 => Some(Self::Ggg),
+            15 => Some(Self::Aaa),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum UastcChannelType {
+    Rgb = 0,
+    Rgba = 3,
+    Rrr = 4,
+    Rrrg = 5,
+    Rg = 6,
+}
+
+impl UastcChannelType {
+    fn parse(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Rgb),
+            3 => Some(Self::Rgba),
+            4 => Some(Self::Rrr),
+            5 => Some(Self::Rrrg),
+            6 => Some(Self::Rg),
+            _ => None,
+        }
+    }
+}
+
+// https://www.khronos.org/registry/DataFormat/specs/1.3/dataformat.1.3.html#_emphasis_role_strong_emphasis_colorprimaries_emphasis_emphasis
+#[derive(Debug)]
+enum ColorPrimaries {
+    Unspecified = 0,
+    Bt709,
+}
+
+impl ColorPrimaries {
+    fn parse(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unspecified),
+            1 => Some(Self::Bt709),
+            _ => None,
         }
     }
 }
